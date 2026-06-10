@@ -1,6 +1,5 @@
 import argparse
 import base64
-import copy
 import hashlib
 import json
 import os
@@ -19,49 +18,25 @@ ENDPOINT = "https://mrr.readoor.cn/api/3.1/stat/v1/b/stat31/stat/pStatIf"
 SECTIONS_ENDPOINT = "https://api3.readoor.cn/api/3.0/app/v1/dms/spu/sections"
 APP_INFO_ENDPOINT = "https://api3.readoor.cn/api/3.1/app/v1/app/info"
 IAAA_LOGIN_ENDPOINT = "https://iaaa.pku.edu.cn/iaaa/oauthlogin.do"
-DEFAULT_IAAA_OAUTH_URL = (
-    "https://iaaa.pku.edu.cn/iaaa/oauth.jsp?"
-    "redirectUrl=https%3A%2F%2Fidp.readoor.cn%2Fapi%2F3.0%2Fidp%2Fv1%2Fag%2Fcb%2Fbd%3Fticket%3DpkuQmwJHMYGKcOq"
-    "&appID=yunxuetang"
-)
 NEW_KEY = "AUe#2jE31o90"
 REFERER = (
     "https://byyxt.pupedu.cn/550278742975483904/c/pc/viewer"
     "?spu_guid=570535132977475584&group_id=16211&training_id=17296"
     "&project_id=408520&section_guid=570542196487401472"
 )
-
-
-TEMPLATE_PAYLOAD = {
-    "base_data": {
-        "app_id": 1753673475,
-        "company_id": 395,
-        "time_stamp": 1781110175823,
-        "class_id": "16211",
-        "train_id": "17296",
-        "project_id": "408520",
-        "platform_code": "pweb",
-        "item_id": "570535132977475584",
-        "spu_type": 302,
-    },
-    "lesson_data": [
-        {
-            "media_theory_length": 1009.36,
-            "max_position": 1009.38,
-            "position": 1009.38,
-            "study_time": 40,
-            "end_time": 1781110175,
-            "start_time": 1781110135,
-            "session_id": "02d96266-993e-4241-a96c-1194e7bb7e23",
-            "sequence_id": 7,
-            "section_guid": "570542196487401472",
-            "courseware_type": 104,
-            "section_type": 403,
-            "task_guid": "588410513113788416",
-            "c4MTEx": "1",
-        }
-    ],
-}
+COURSE_CLASS_ID = "16211"
+COURSE_TRAIN_ID = "17296"
+COURSE_PROJECT_ID = "408520"
+COURSE_TASK_GUID = "588410513113788416"
+COURSE_SPU_GUID = "570535132977475584"
+COURSE_SPU_TYPE = 302
+DEFAULT_SECTION_GUID = "570542196487401472"
+DEFAULT_COURSEWARE_TYPE = 104
+DEFAULT_SECTION_TYPE = 403
+DEFAULT_MEDIA_DURATION = 1009.36
+DEFAULT_STUDY_TIME = 40
+DEFAULT_SEQUENCE_ID = 7
+DEFAULT_PLATFORM_CODE = "pweb"
 
 
 def md5_hex(value: str) -> str:
@@ -126,6 +101,56 @@ def parse_iaaa_oauth_url(oauth_url: str) -> tuple[str, str]:
     return redir_url, app_id
 
 
+def build_callback_url(app_guid: str, *, path: str | None = None, extra: dict[str, str] | None = None) -> str:
+    cb = uuid.uuid4().hex[:16]
+    path = path or f"/{app_guid}/home"
+    query = {
+        "logintype": "sf",
+        "cb": cb,
+        **(extra or {}),
+    }
+    qs = "&".join(f"{key}={requests.utils.quote(str(value), safe='')}" for key, value in query.items())
+    return f"https://byyxt.pupedu.cn{path}?{qs}"
+
+
+def build_beida_entry_url(app_info: dict, *, callback_url: str | None = None, a_uri: dict | None = None) -> str:
+    callback_url = callback_url or build_callback_url(str(app_info["app_guid"]), extra={"f": "bd", "r": "2"})
+    a_uri = a_uri or {}
+    base = app_info["idp"].get("domain") or "https://idp.readoor.cn/"
+    base = base.rstrip("/")
+    return (
+        f"{base}/api/3.0/idp/v1/ag/bd?"
+        f"&terminal_id=4"
+        f"&mode=20"
+        f"&app_guid={requests.utils.quote(str(app_info['app_guid']), safe='')}"
+        f"&appid={requests.utils.quote(str(app_info['idp']['idaas_app_id']), safe='')}"
+        f"&company_guid={requests.utils.quote(str(app_info['company_guid']), safe='')}"
+        f"&callback={requests.utils.quote(callback_url, safe='')}"
+        f"&a_uri={requests.utils.quote(json.dumps(a_uri, separators=(',', ':')), safe='')}"
+    )
+
+
+def fetch_dynamic_iaaa_oauth_url(app_info: dict) -> str:
+    a_uri = {}
+    for mode in app_info.get("idp", {}).get("config", {}).get("mode_config", []) or []:
+        if str(mode.get("mode_id")) == "20":
+            rel = (((mode.get("ext_config") or {}).get("rel")) or {})
+            if rel.get("enterprise_id") not in (None, ""):
+                a_uri["enterprise_id"] = rel["enterprise_id"]
+            if rel.get("org_id") not in (None, ""):
+                a_uri["org_id"] = rel["org_id"]
+            break
+    entry_url = build_beida_entry_url(app_info, a_uri=a_uri)
+    response = requests.get(entry_url, timeout=30, allow_redirects=False)
+    location = response.headers.get("Location") or response.headers.get("location")
+    if not location or "iaaa.pku.edu.cn/iaaa/oauth.jsp" not in location:
+        raise RuntimeError(
+            "Could not fetch dynamic IAAA oauth URL from beida entrypoint. "
+            f"status={response.status_code} location={location!r}"
+        )
+    return location
+
+
 def fetch_app_info(app_guid: str, terminal_id: str = "4") -> dict:
     response = requests.post(APP_INFO_ENDPOINT, data=build_app_info_form(app_guid, terminal_id), timeout=30)
     response.raise_for_status()
@@ -143,8 +168,13 @@ def login_iaaa_for_token_code(
     username: str,
     password: str,
     *,
-    oauth_url: str,
+    oauth_url: str | None = None,
+    app_info: dict | None = None,
 ) -> tuple[str, dict]:
+    if oauth_url is None:
+        if app_info is None:
+            raise ValueError("Need either oauth_url or app_info to start IAAA login")
+        oauth_url = fetch_dynamic_iaaa_oauth_url(app_info)
     redir_url, app_id = parse_iaaa_oauth_url(oauth_url)
     session = requests.Session()
     response = session.post(
@@ -184,7 +214,7 @@ def login_iaaa_for_token_code(
             "Could not extract token_code from IAAA callback. "
             f"status={callback_response.status_code} location={location!r}"
         )
-    return token_code, {"oauth_token": oauth_token, "location": location}
+    return token_code, {"oauth_token": oauth_token, "oauth_url": oauth_url, "location": location}
 
 
 def exchange_token_code(token_code: str, app_info: dict) -> dict:
@@ -209,40 +239,51 @@ def dynamic_done_field(timestamp_ms: int) -> str:
 
 def build_payload(
     *,
+    spu_guid: str,
+    task_guid: str,
     complete: bool,
     session_id: str | None,
     sequence_id: int | None,
     study_time: int | None,
     position: float | None,
 ) -> dict:
-    payload = copy.deepcopy(TEMPLATE_PAYLOAD)
-    lesson = payload["lesson_data"][0]
-
     now_ms = int(time.time() * 1000)
     now_s = now_ms // 1000
+    lesson_study_time = study_time if study_time is not None else DEFAULT_STUDY_TIME
+    lesson_position = position if position is not None else DEFAULT_MEDIA_DURATION
+    lesson_session_id = session_id or str(uuid.uuid4())
+    lesson_sequence_id = sequence_id if sequence_id is not None else DEFAULT_SEQUENCE_ID
 
-    payload["base_data"]["time_stamp"] = now_ms
-    lesson["end_time"] = now_s
-
-    if study_time is not None:
-        lesson["study_time"] = study_time
-    if position is not None:
-        lesson["position"] = position
-        lesson["max_position"] = position
-
-    if session_id:
-        lesson["session_id"] = session_id
-    else:
-        lesson["session_id"] = str(uuid.uuid4())
-
-    if sequence_id is not None:
-        lesson["sequence_id"] = sequence_id
-
-    lesson["start_time"] = lesson["end_time"] - int(lesson["study_time"])
-
-    for key in list(lesson.keys()):
-        if key.startswith("c") and key != "courseware_type":
-            del lesson[key]
+    payload = {
+        "base_data": {
+            "app_id": 0,
+            "company_id": 0,
+            "time_stamp": now_ms,
+            "class_id": COURSE_CLASS_ID,
+            "train_id": COURSE_TRAIN_ID,
+            "project_id": COURSE_PROJECT_ID,
+            "platform_code": DEFAULT_PLATFORM_CODE,
+            "item_id": str(spu_guid),
+            "spu_type": COURSE_SPU_TYPE,
+        },
+        "lesson_data": [
+            {
+                "media_theory_length": DEFAULT_MEDIA_DURATION,
+                "max_position": lesson_position,
+                "position": lesson_position,
+                "study_time": lesson_study_time,
+                "end_time": now_s,
+                "start_time": now_s - int(lesson_study_time),
+                "session_id": lesson_session_id,
+                "sequence_id": lesson_sequence_id,
+                "section_guid": DEFAULT_SECTION_GUID,
+                "courseware_type": DEFAULT_COURSEWARE_TYPE,
+                "section_type": DEFAULT_SECTION_TYPE,
+                "task_guid": str(task_guid),
+            }
+        ],
+    }
+    lesson = payload["lesson_data"][0]
 
     done_key = dynamic_done_field(now_ms)
     lesson[done_key] = "1" if complete else 0
@@ -397,20 +438,20 @@ def main() -> None:
     parser.add_argument("--username", default=os.environ.get("READOOR_USERNAME"), help="PKU username for IAAA login.")
     parser.add_argument("--password", default=os.environ.get("READOOR_PASSWORD"), help="PKU password for IAAA login.")
     parser.add_argument("--token-code", help="Skip IAAA login and exchange this token_code directly.")
-    parser.add_argument("--iaaa-oauth-url", default=DEFAULT_IAAA_OAUTH_URL, help="Full IAAA oauth.jsp URL containing redirectUrl and appID.")
+    parser.add_argument("--iaaa-oauth-url", help="Optional full IAAA oauth.jsp URL. Usually not needed; the script can fetch a fresh one dynamically.")
     parser.add_argument("--app-guid", default="550278742975483904", help="App guid used for app info and token exchange.")
     parser.add_argument("--terminal-id", default="4", help="Terminal id used in app info/signature requests. PC is 4.")
     parser.add_argument("--login-only", action="store_true", help="Only perform login / token exchange and print the Bearer token.")
-    parser.add_argument("--spu-guid", default=str(TEMPLATE_PAYLOAD["base_data"]["item_id"]), help="spu_guid / item_id.")
+    parser.add_argument("--spu-guid", default=COURSE_SPU_GUID, help="spu_guid / item_id.")
     parser.add_argument("--module-id", help="module_id for the sections API.")
     parser.add_argument("--section-guid", help="Pick a section by section_guid from API/file data.")
-    parser.add_argument("--task-guid", default=TEMPLATE_PAYLOAD["lesson_data"][0]["task_guid"], help="Optional task_guid to attach to pStatIf.")
+    parser.add_argument("--task-guid", default=COURSE_TASK_GUID, help="Optional task_guid to attach to pStatIf.")
     parser.add_argument("--sections-file", help="Use a saved sections response JSON instead of calling the sections API.")
     parser.add_argument("--list-sections", action="store_true", help="Fetch or load sections and print them.")
     parser.add_argument("--choose-section", action="store_true", help="Interactively choose a playable section after loading sections.")
     parser.add_argument("--session-id", help="Reuse an existing session_id. Defaults to a new uuid4.")
     parser.add_argument("--sequence-id", type=int, help="Override sequence_id.")
-    parser.add_argument("--study-time", type=int, default=40, help="study_time in seconds.")
+    parser.add_argument("--study-time", type=int, default=DEFAULT_STUDY_TIME, help="study_time in seconds.")
     parser.add_argument("--position", type=float, help="Override position/max_position. Ignored when --incomplete is not set.")
     parser.add_argument("--incomplete", action="store_true", help="Send an unfinished payload instead of a completed one.")
     parser.add_argument("--dump-only", action="store_true", help="Only print JSON and encrypted form, do not send.")
@@ -425,6 +466,7 @@ def main() -> None:
             args.username,
             args.password,
             oauth_url=args.iaaa_oauth_url,
+            app_info=app_info,
         )
         print("=== IAAA callback ===")
         print(json.dumps(login_meta, indent=2, ensure_ascii=False))
@@ -464,6 +506,8 @@ def main() -> None:
             return
 
     payload = build_payload(
+        spu_guid=args.spu_guid,
+        task_guid=args.task_guid,
         complete=not args.incomplete,
         session_id=args.session_id,
         sequence_id=args.sequence_id,

@@ -387,7 +387,38 @@ def list_playable_sections(sections_payload: dict) -> list[dict]:
     ]
 
 
-def prompt_for_section(sections_payload: dict) -> dict:
+def parse_multi_value(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def resolve_sections(sections_payload: dict, selectors: list[str] | None = None) -> list[dict]:
+    playable_sections = list_playable_sections(sections_payload)
+    if not playable_sections:
+        raise ValueError("No playable sections found in payload")
+
+    if not selectors:
+        return [playable_sections[0]]
+
+    chosen_sections: list[dict] = []
+    for selector in selectors:
+        section = None
+        if selector.isdigit():
+            index = int(selector)
+            if 1 <= index <= len(playable_sections):
+                section = playable_sections[index - 1]
+        if section is None:
+            for candidate in playable_sections:
+                if str(candidate.get("section_guid")) == selector:
+                    section = candidate
+                    break
+        if section is None:
+            raise ValueError(f"Invalid section selector: {selector}")
+        if all(str(existing.get("section_guid")) != str(section.get("section_guid")) for existing in chosen_sections):
+            chosen_sections.append(section)
+    return chosen_sections
+
+
+def prompt_for_sections(sections_payload: dict) -> list[dict]:
     playable_sections = list_playable_sections(sections_payload)
     if not playable_sections:
         raise ValueError("No playable sections found in payload")
@@ -403,33 +434,23 @@ def prompt_for_section(sections_payload: dict) -> dict:
         )
 
     while True:
-        raw = input("Choose section number or section_guid: ").strip()
+        raw = input("Choose section number(s) or section_guid(s), comma-separated: ").strip()
         if not raw:
             print("Please enter a value.")
             continue
-        if raw.isdigit():
-            index = int(raw)
-            if 1 <= index <= len(playable_sections):
-                return playable_sections[index - 1]
-        for section in playable_sections:
-            if str(section.get("section_guid")) == raw:
-                return section
-        print("Invalid selection, try again.")
+        try:
+            return resolve_sections(sections_payload, parse_multi_value(raw))
+        except ValueError:
+            print("Invalid selection, try again.")
 
 
-def choose_section(sections_payload: dict, section_guid: str | None) -> dict:
+def choose_sections(sections_payload: dict, section_guid: str | None) -> list[dict]:
     sections = sections_payload.get("data", {}).get("sections", [])
     if not sections:
         raise ValueError("No sections found in payload")
     if section_guid:
-        for section in sections:
-            if str(section.get("section_guid")) == str(section_guid):
-                return section
-        raise ValueError(f"section_guid not found: {section_guid}")
-    for section in sections:
-        if section.get("courseware_type") and section.get("section_type") == 403:
-            return section
-    return sections[0]
+        return resolve_sections(sections_payload, parse_multi_value(section_guid))
+    return resolve_sections(sections_payload, None)
 
 
 def main() -> None:
@@ -505,41 +526,48 @@ def main() -> None:
         if args.dump_only:
             return
 
-    payload = build_payload(
-        spu_guid=args.spu_guid,
-        task_guid=args.task_guid,
-        complete=not args.incomplete,
-        session_id=args.session_id,
-        sequence_id=args.sequence_id,
-        study_time=args.study_time,
-        position=args.position,
-    )
-    payload = apply_app_info_to_payload(payload, app_info)
+    selected_sections: list[dict | None]
     if sections_payload is not None:
         if args.choose_section and not args.section_guid:
-            section = prompt_for_section(sections_payload)
+            selected_sections = prompt_for_sections(sections_payload)
         else:
-            section = choose_section(sections_payload, args.section_guid)
-        print("\n=== chosen section ===")
-        print(json.dumps(format_section_summary(section), indent=2, ensure_ascii=False))
-        payload = apply_section_to_payload(payload, section, spu_guid=args.spu_guid, task_guid=args.task_guid)
-    encrypted = encrypt_payload(payload)
+            selected_sections = choose_sections(sections_payload, args.section_guid)
+    else:
+        selected_sections = [None]
 
-    print("=== JSON payload ===")
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
-    print("\n=== Form payload ===")
-    print(json.dumps(encrypted, indent=2, ensure_ascii=False))
+    for index, section in enumerate(selected_sections, start=1):
+        payload = build_payload(
+            spu_guid=args.spu_guid,
+            task_guid=args.task_guid,
+            complete=not args.incomplete,
+            session_id=args.session_id,
+            sequence_id=args.sequence_id,
+            study_time=args.study_time,
+            position=args.position,
+        )
+        payload = apply_app_info_to_payload(payload, app_info)
+        if section is not None:
+            print(f"\n=== chosen section {index}/{len(selected_sections)} ===")
+            print(json.dumps(format_section_summary(section), indent=2, ensure_ascii=False))
+            payload = apply_section_to_payload(payload, section, spu_guid=args.spu_guid, task_guid=args.task_guid)
 
-    if args.dump_only:
-        return
+        encrypted = encrypt_payload(payload)
 
-    if not token:
-        raise SystemExit("Missing token. Pass --token or login with --username/--password.")
+        print(f"\n=== JSON payload {index}/{len(selected_sections)} ===")
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        print(f"\n=== Form payload {index}/{len(selected_sections)} ===")
+        print(json.dumps(encrypted, indent=2, ensure_ascii=False))
 
-    response = send_probe(token, encrypted)
-    print("\n=== HTTP response ===")
-    print(f"status_code={response.status_code}")
-    print(response.text)
+        if args.dump_only:
+            continue
+
+        if not token:
+            raise SystemExit("Missing token. Pass --token or login with --username/--password.")
+
+        response = send_probe(token, encrypted)
+        print(f"\n=== HTTP response {index}/{len(selected_sections)} ===")
+        print(f"status_code={response.status_code}")
+        print(response.text)
 
 
 if __name__ == "__main__":
